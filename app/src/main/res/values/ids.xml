@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="checked" type="id" />
+    <item name="icon_frame" type="id" />
+    <item name="off" type="id" />
+    <item name="on" type="id" />
+    <item name="recycler_view" type="id" />
+    <item name="seekbar" type="id" />
+    <item name="seekbar_value" type="id" />
+    <item name="spinner" type="id" />
+    <item name="switchWidget" type="id" />
+    <item name="unchecked" type="id" />
+</resources>
