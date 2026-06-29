@@ -165,7 +165,6 @@
         <meta-data
             android:name="android.allow_multiple_resumed_activities"
             android:value="true" />
-        >
 
     </application>
 </manifest>
