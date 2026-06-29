@@ -17,3 +17,53 @@
 #}
 
 #-dontobfuscate
+
+# Native methods are resolved by static JNI names in libwinlator.so.
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
+
+# Native code looks up these Java classes and callbacks by string name.
+-keep class com.winlator.cmod.core.AppUtils {
+    public static java.lang.String getNativeLibDir(android.content.Context);
+}
+-keep class com.winlator.cmod.contents.AdrenotoolsManager {
+    public <init>(android.content.Context);
+    public java.lang.String getLibraryName(java.lang.String);
+}
+-keepclassmembers class com.winlator.cmod.xconnector.XConnectorEpoll {
+    private void handleNewConnection(int);
+    private void handleExistingConnection(int);
+}
+-keepclassmembers class com.winlator.cmod.xconnector.ClientSocket {
+    public void addAncillaryFd(int);
+}
+-keepclassmembers class com.winlator.cmod.renderer.GPUImage {
+    private void setStride(short);
+}
+
+# Retrofit needs runtime annotations and generic signatures.
+-keepattributes Signature, RuntimeVisibleAnnotations, RuntimeVisibleParameterAnnotations, AnnotationDefault
+-keep interface com.winlator.cmod.bigpicture.steamgrid.SteamGridDBApi { *; }
+-dontwarn retrofit2.**
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-dontwarn com.android.org.conscrypt.SSLParametersImpl
+-dontwarn org.apache.harmony.xnet.provider.jsse.SSLParametersImpl
+
+# zstd-jni native code reads these fields by their original names.
+-keepclassmembers class com.github.luben.zstd.ZstdInputStreamNoFinalizer {
+    private long dstPos;
+    private long srcPos;
+    private long srcSize;
+}
+-keepclassmembers class com.github.luben.zstd.ZstdOutputStreamNoFinalizer {
+    private long srcPos;
+    private long dstPos;
+}
+
+# Gson models use @SerializedName and reflection-based adapters.
+-keepclassmembers,allowobfuscation class * {
+    @com.google.gson.annotations.SerializedName <fields>;
+}
+-keep class com.winlator.cmod.bigpicture.steamgrid.** { *; }

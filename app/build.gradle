@@ -157,7 +157,15 @@ android {
         debug {
             minifyEnabled false
         }
-        // If you have a release build type, add it here
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    lint {
+        disable 'ExpiredTargetSdkVersion'
     }
 
     ndkVersion '29.0.14206865'
