@@ -4,17 +4,20 @@ import android.os.Process;
 import android.util.Log;
 
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.Executors;
 
 public abstract class ProcessHelper {
     public static final boolean PRINT_DEBUG = true; // FIXME change to false
@@ -23,31 +26,75 @@ public abstract class ProcessHelper {
     private static final byte SIGSTOP = 19;
     private static final byte SIGTERM = 15;
     private static final byte SIGKILL = 9;
+    private static volatile boolean useRootForSignals = false;
+    private static volatile String wineProcessEnvFilter = "";
 
+    private static volatile boolean hasUsedRootSession = false;
+
+    public static void setUseRootForSignals(boolean enabled) {
+        useRootForSignals = enabled;
+    }
+
+    public static void setWineProcessEnvFilter(String winePrefix) {
+        wineProcessEnvFilter = winePrefix != null && !winePrefix.isEmpty() ? "WINEPREFIX=" + winePrefix : "";
+    }
+
+    public static boolean hasUsedRootSession() {
+        return hasUsedRootSession;
+    }
     public static void suspendProcess(int pid) {
-        Process.sendSignal(pid, SIGSTOP);
+        sendSignal(pid, SIGSTOP);
         Log.d("ProcessHelper", "Process suspended with pid: " + pid);
     }
 
     public static void resumeProcess(int pid) {
-        Process.sendSignal(pid, SIGCONT);
+        sendSignal(pid, SIGCONT);
         Log.d("ProcessHelper", "Process resumed with pid: " + pid);
     }
 
     public static void terminateProcess(int pid) {
-        Process.sendSignal(pid, SIGTERM);
+        sendSignal(pid, SIGTERM);
         Log.d("ProcessHelper", "Process terminated with pid: " + pid);
     }
 
     public static void killProcess(int pid) {
-        Process.sendSignal(pid, SIGKILL);
+        sendSignal(pid, SIGKILL);
         Log.d("ProcessHelper", "Process killed with pid: " + pid);
+    }
+
+    private static void sendSignal(int pid, int signal) {
+        if (useRootForSignals) {
+            execRootCommandAndWait("kill -" + signal + " " + pid);
+            return;
+        }
+        Process.sendSignal(pid, signal);
     }
 
     public static void terminateAllWineProcesses() {
         for (String process : listRunningWineProcesses()) {
             terminateProcess(Integer.parseInt(process));
         }
+    }
+
+    public static void killAllWineProcesses() {
+        for (String process : listRunningWineProcesses()) {
+            killProcess(Integer.parseInt(process));
+        }
+    }
+
+    public static boolean waitForWineProcessesExit(long timeoutMs) {
+        long start = System.currentTimeMillis();
+        while (!listRunningWineProcesses().isEmpty()) {
+            if (System.currentTimeMillis() - start >= timeoutMs) return false;
+            try {
+                Thread.sleep(50);
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return true;
     }
 
     public static void pauseAllWineProcesses() {
@@ -118,8 +165,223 @@ public abstract class ProcessHelper {
         return pid;
     }
 
+    public static int execAsRoot(String command, String[] envp, File workingDir, Callback<Integer> terminationCallback) {
+        Log.d("ProcessHelper", "root env: " + Arrays.toString(envp) + "\ncmd: " + command);
+
+        EnvironmentManager.setEnvVars(envp);
+
+        int pid = -1;
+        try {
+            File pidFile = createRootPidFile(workingDir);
+            java.lang.Process process = Runtime.getRuntime().exec("su");
+            hasUsedRootSession = true;
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream()));
+
+            if (envp != null) {
+                for (String entry : envp) {
+                    int index = entry.indexOf('=');
+                    if (index <= 0) continue;
+                    String name = entry.substring(0, index);
+                    String value = entry.substring(index + 1);
+                    if (!isValidEnvName(name)) continue;
+                    writer.write("export " + name + "=" + shellQuote(value) + "\n");
+                }
+            }
+
+            if (workingDir != null) {
+                writer.write("cd " + shellQuote(workingDir.getAbsolutePath()) + "\n");
+            }
+            writer.write(command + " &\n");
+            writer.write("child=$!\n");
+            writer.write("echo $child > " + shellQuote(pidFile.getAbsolutePath()) + "\n");
+            writer.write("wait $child\n");
+            writer.write("exit $?\n");
+            writer.flush();
+            writer.close();
+
+            Field pidField = process.getClass().getDeclaredField("pid");
+            pidField.setAccessible(true);
+            pid = pidField.getInt(process);
+            pidField.setAccessible(false);
+
+            attachOutputThreads(process);
+            int childPid = waitForPidFile(pidFile);
+            if (childPid != -1) pid = childPid;
+
+            createWaitForThread(process, (status) -> {
+                pidFile.delete();
+                if (terminationCallback != null) terminationCallback.call(status);
+            });
+        }
+        catch (Exception e) {
+            Log.e("ProcessHelper", "Error executing root command: " + command, e);
+        }
+        return pid;
+    }
+
+    public static boolean isRootAvailable() {
+        java.lang.Process process = null;
+        try {
+            process = Runtime.getRuntime().exec("su");
+            DataOutputStream outputStream = new DataOutputStream(process.getOutputStream());
+            outputStream.writeBytes("id -u\n");
+            outputStream.writeBytes("exit\n");
+            outputStream.flush();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String uid = reader.readLine();
+            int status = process.waitFor();
+            boolean available = status == 0 && "0".equals(uid != null ? uid.trim() : "");
+            if (available) hasUsedRootSession = true;
+            return available;
+        }
+        catch (Exception e) {
+            Log.w("ProcessHelper", "Root is not available", e);
+            return false;
+        }
+        finally {
+            if (process != null) process.destroy();
+        }
+    }
+
+    public static boolean chownAsRoot(String path) {
+        return chown(path, "0:0");
+    }
+
+    public static boolean chownAsAppUser(String path) {
+        int uid = Process.myUid();
+        return chown(path, uid + ":" + uid);
+    }
+
+    private static boolean chown(String path, String owner) {
+        if (path == null || path.isEmpty()) return false;
+        return execRootCommandAndWait("chown -R " + shellQuote(owner) + " " + shellQuote(path)) == 0;
+    }
+
+    private static int execRootCommandAndWait(String command) {
+        java.lang.Process process = null;
+        try {
+            process = Runtime.getRuntime().exec("su");
+            attachOutputThreads(process);
+            DataOutputStream outputStream = new DataOutputStream(process.getOutputStream());
+            outputStream.writeBytes(command + "\n");
+            outputStream.writeBytes("exit\n");
+            outputStream.flush();
+            int status = process.waitFor();
+            if (status == 0) hasUsedRootSession = true;
+            return status;
+        }
+        catch (Exception e) {
+            Log.e("ProcessHelper", "Error executing root shell command: " + command, e);
+            return -1;
+        }
+        finally {
+            if (process != null) process.destroy();
+        }
+    }
+
+    private static ArrayList<String> execRootCommandAndReadLines(String command) {
+        ArrayList<String> result = new ArrayList<>();
+        java.lang.Process process = null;
+        try {
+            process = Runtime.getRuntime().exec("su");
+            createDrainThread(process.getErrorStream());
+            DataOutputStream outputStream = new DataOutputStream(process.getOutputStream());
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            outputStream.writeBytes(command + "\n");
+            outputStream.writeBytes("exit\n");
+            outputStream.flush();
+            outputStream.close();
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (!line.isEmpty()) result.add(line);
+            }
+            reader.close();
+
+            if (process.waitFor() == 0) hasUsedRootSession = true;
+        }
+        catch (Exception e) {
+            Log.e("ProcessHelper", "Error executing root shell command: " + command, e);
+        }
+        finally {
+            if (process != null) process.destroy();
+        }
+        return result;
+    }
+
+    private static File createRootPidFile(File workingDir) throws IOException {
+        File pidFile = File.createTempFile("winlator-root-", ".pid", workingDir);
+        FileUtils.chmod(pidFile, 0666);
+        return pidFile;
+    }
+
+    private static int waitForPidFile(File pidFile) {
+        for (int i = 0; i < 100; i++) {
+            try {
+                byte[] data = FileUtils.read(pidFile);
+                String pid = data != null ? new String(data, StandardCharsets.UTF_8).trim() : "";
+                if (!pid.isEmpty()) return Integer.parseInt(pid);
+                Thread.sleep(20);
+            }
+            catch (NumberFormatException e) {
+                return -1;
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean isValidEnvName(String name) {
+        if (name == null || name.isEmpty()) return false;
+        char first = name.charAt(0);
+        if (!(first == '_' || Character.isLetter(first))) return false;
+        for (int i = 1; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (!(c == '_' || Character.isLetterOrDigit(c))) return false;
+        }
+        return true;
+    }
+
+    private static String shellQuote(String value) {
+        if (value == null) return "''";
+        return "'" + value.replace("'", "'\"'\"'") + "'";
+    }
+
+    private static void attachOutputThreads(java.lang.Process process) {
+        if (!debugCallbacks.isEmpty()) {
+            createDebugThread(process.getInputStream());
+            createDebugThread(process.getErrorStream());
+        }
+        else {
+            createDrainThread(process.getInputStream());
+            createDrainThread(process.getErrorStream());
+        }
+    }
+
+    private static void createDrainThread(final InputStream inputStream) {
+        new Thread(() -> {
+            try {
+                byte[] buffer = new byte[8192];
+                while (inputStream.read(buffer) != -1) {}
+            }
+            catch (IOException e) {
+                Log.e("ProcessHelper", "Error draining process output", e);
+            }
+            finally {
+                try {
+                    inputStream.close();
+                }
+                catch (IOException e) {}
+            }
+        }).start();
+    }
+
     private static void createDebugThread(final InputStream inputStream) {
-        Executors.newSingleThreadExecutor().execute(() -> {
+        new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
@@ -134,11 +396,11 @@ public abstract class ProcessHelper {
             catch (IOException e) {
                 Log.e("ProcessHelper", "Error in debug thread", e);
             }
-        });
+        }).start();
     }
 
     private static void createWaitForThread(java.lang.Process process, final Callback<Integer> terminationCallback) {
-        Executors.newSingleThreadExecutor().execute(new Runnable() {
+        new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -149,7 +411,7 @@ public abstract class ProcessHelper {
                     Log.e("ProcessHelper", "Error waiting for process termination", e);
                 }
             }
-        });
+        }).start();
     }
 
     public static void removeAllDebugCallbacks() {
@@ -257,6 +519,8 @@ public abstract class ProcessHelper {
     }
 
     public static ArrayList<String> listRunningWineProcesses(){
+        if (useRootForSignals) return listRunningWineProcessesAsRoot();
+
         File proc = new File("/proc");
         String[] filters = {"wine", "exe"};
         String[] allPids;
@@ -280,6 +544,26 @@ public abstract class ProcessHelper {
                 if (data.contains(filter))
                     filteredPids.add(allPids[index]);
             }
+        }
+        return filteredPids;
+    }
+
+    private static ArrayList<String> listRunningWineProcessesAsRoot() {
+        ArrayList<String> filteredPids = new ArrayList<>();
+        if (wineProcessEnvFilter.isEmpty()) return filteredPids;
+
+        ArrayList<String> lines = execRootCommandAndReadLines(
+                "for pid in /proc/[0-9]*; do " +
+                "data=$(cat \"$pid/stat\" 2>/dev/null) || continue; " +
+                "case \"$data\" in *wine*|*exe*) ;; *) continue;; esac; " +
+                "tr '\\000' '\\n' < \"$pid/environ\" 2>/dev/null | grep -Fxq " + shellQuote(wineProcessEnvFilter) + " || continue; " +
+                "echo \"${pid#/proc/}\"; " +
+                "done"
+        );
+
+        for (String line : lines) {
+            if (line.matches("[0-9]+") && !filteredPids.contains(line))
+                filteredPids.add(line);
         }
         return filteredPids;
     }

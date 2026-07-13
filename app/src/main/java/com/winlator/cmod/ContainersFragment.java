@@ -44,6 +44,7 @@ import com.winlator.cmod.contentdialog.StorageInfoDialog;
 import com.winlator.cmod.core.AppUtils;
 import com.winlator.cmod.core.FileUtils;
 import com.winlator.cmod.core.PreloaderDialog;
+import com.winlator.cmod.core.ProcessHelper;
 import com.winlator.cmod.xenvironment.ImageFs;
 
 import java.io.File;
@@ -201,6 +202,9 @@ public class ContainersFragment extends Fragment {
             PopupMenu listItemMenu = new PopupMenu(context, anchorView);
             listItemMenu.inflate(R.menu.container_popup_menu);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) listItemMenu.setForceShowIcon(true);
+            if (ProcessHelper.hasUsedRootSession()) {
+                ProcessHelper.chownAsAppUser(container.getRootDir().getPath());
+            }
 
             listItemMenu.setOnMenuItemClickListener((menuItem) -> {
                 switch (menuItem.getItemId()) {

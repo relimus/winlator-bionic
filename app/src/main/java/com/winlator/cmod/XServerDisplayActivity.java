@@ -178,6 +178,8 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     private boolean isPaused = false;
     private boolean isRelativeMouseMovement = false;
     private boolean isSuspendEnabled = true;
+    private boolean launchWithRoot = true;
+    private volatile boolean isExiting = false;
 
     // Inside the XServerDisplayActivity class
     private SensorManager sensorManager;
@@ -201,7 +203,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
 
     private GuestProgramLauncherComponent guestProgramLauncherComponent;
     private EnvVars overrideEnvVars;
-    
+
     public boolean performanceMode;
 
     @Override
@@ -246,12 +248,12 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
 
     	return maxRefresh;
     }
-    
-     
+
+
     public void setRefreshRate(float refreshRate) {
         this.refreshRate = refreshRate;
     }
-    
+
     public float getRefreshRate() {
         return this.refreshRate;
     }
@@ -609,6 +611,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
                 simulateConfirmInputControlsDialog();
             }
             Executors.newSingleThreadExecutor().execute(() -> {
+                prepareRootSession();
                 setupWineSystemFiles();
                 extractGraphicsDriverFiles();
                 changeWineAudioDriver();
@@ -751,7 +754,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             // Re-register the sensor listener when the activity is resumed
             sensorManager.registerListener(gyroListener, gyroSensor, SensorManager.SENSOR_DELAY_GAME);
         }
-        
+
         if (!isInPictureInPictureMode())
             xServerView.onResume();
 
@@ -789,8 +792,8 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             if (environment != null) {
                 environment.onPause();
             }
-            
-            xServerView.onPause();    
+
+            xServerView.onPause();
             
             if (isSuspendEnabled)
                 ProcessHelper.pauseAllWineProcesses();
@@ -832,6 +835,8 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     }
 
     private void exit() {
+        if (isExiting) return;
+        isExiting = true;
         preloaderDialog.showOnUiThread(R.string.shutdown);
         handler.postDelayed(new Runnable() {
             @Override
@@ -841,23 +846,29 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
                 if (midiHandler != null) midiHandler.stop();
                 // Unregister sensor listener to avoid memory leaks
                 if (sensorManager != null) sensorManager.unregisterListener(gyroListener);
-                if (environment != null) environment.stopEnvironmentComponents();
-                if (preloaderDialog != null && preloaderDialog.isShowing()) preloaderDialog.closeOnUiThread();
-                if (winHandler != null) winHandler.stop();
-                if (wineRequestHandler != null) wineRequestHandler.stop();
-                xServerView.onDestroy();
-                /* Gracefully terminate all running wine processes */
-                ProcessHelper.terminateAllWineProcesses();
-                /* Wait until all processes have gracefully terminated, forcefully killing them only after a certain amount of time */
-                long start = System.currentTimeMillis();
-                while (!ProcessHelper.listRunningWineProcesses().isEmpty()) {
-                    long elapsed = System.currentTimeMillis() - start;
-                    if (elapsed >= 1500) {
-                        break;
+                Executors.newSingleThreadExecutor().execute(() -> {
+                    if (environment != null) environment.stopEnvironmentComponents();
+                    if (preloaderDialog != null && preloaderDialog.isShowing()) preloaderDialog.closeOnUiThread();
+                    if (winHandler != null) winHandler.stop();
+                    if (wineRequestHandler != null) wineRequestHandler.stop();
+                    xServerView.onDestroy();
+                    /* Gracefully terminate all running wine processes */
+                    cleanupWineProcesses();
+                    if (launchWithRoot && ProcessHelper.hasUsedRootSession())
+                        ProcessHelper.chownAsAppUser(container.getRootDir().getPath());
+                    /* Wait until all processes have gracefully terminated, forcefully killing them only after a certain amount of time */
+                    long start = System.currentTimeMillis();
+                    while (!ProcessHelper.listRunningWineProcesses().isEmpty()) {
+                        long elapsed = System.currentTimeMillis() - start;
+                        if (elapsed >= 1500) {
+                            break;
+                        }
                     }
-                }
-                preloaderDialog.closeOnUiThread();
-                AppUtils.restartApplication(getApplicationContext());
+                    runOnUiThread(() -> {
+                        preloaderDialog.close();
+                        AppUtils.restartApplication(getApplicationContext());
+                    });
+                });
             }
         }, 1000);
     }
@@ -872,6 +883,26 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
         super.onStop();
         savePlaytimeData();
         handler.removeCallbacks(savePlaytimeRunnable);
+    }
+
+    private void cleanupWineProcesses() {
+        /* Gracefully terminate all running wine processes */
+        ProcessHelper.terminateAllWineProcesses();
+        /* Wait until all processes have gracefully terminated, forcefully killing them only after a certain amount of time */
+        if (!ProcessHelper.waitForWineProcessesExit(1500)) {
+            ProcessHelper.killAllWineProcesses();
+            ProcessHelper.waitForWineProcessesExit(1000);
+        }
+    }
+
+    private void prepareRootSession() {
+        launchWithRoot = ProcessHelper.isRootAvailable();
+        ProcessHelper.setUseRootForSignals(launchWithRoot);
+        ProcessHelper.setWineProcessEnvFilter(imageFs.wineprefix);
+        if (launchWithRoot) {
+            cleanupWineProcesses();
+            ProcessHelper.chownAsAppUser(container.getRootDir().getPath());
+        }
     }
 
     @Override
@@ -1072,6 +1103,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             }
             guestProgramLauncherComponent.setContainer(this.container);
             guestProgramLauncherComponent.setWineInfo(this.wineInfo);
+            guestProgramLauncherComponent.setLaunchWithRoot(launchWithRoot);
 
             String guestExecutable = "wine explorer /desktop=shell," + xServer.screenInfo + " " + getWineStartCommand();
 
@@ -1973,7 +2005,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     public void setScreenEffectProfile(String screenEffectProfile) {
         this.screenEffectProfile = screenEffectProfile;
     }
-    
+
     public void updateFrameRating(Window window) {
         if (frameRatingWindowId != window.id) return;
         frameRating.update();

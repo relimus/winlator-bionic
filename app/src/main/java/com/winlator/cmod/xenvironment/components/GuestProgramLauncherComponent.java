@@ -4,7 +4,6 @@ import android.app.Service;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.net.ConnectivityManager;
-import android.os.Process;
 import android.util.Log;
 
 import androidx.preference.PreferenceManager;
@@ -60,6 +59,7 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
     private final ContentProfile wineProfile;
     private Container container;
     private final Shortcut shortcut;
+    private boolean launchWithRoot;
 
     public void setWineInfo(WineInfo wineInfo) {
         this.wineInfo = wineInfo;
@@ -74,6 +74,10 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
 
     public Container getContainer() { return this.container; }
     public void setContainer(Container container) { this.container = container; }
+
+    public void setLaunchWithRoot(boolean launchWithRoot) {
+        this.launchWithRoot = launchWithRoot;
+    }
 
     private void extractBox64Files() {
         ImageFs imageFs = environment.getImageFs();
@@ -159,6 +163,11 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
             else
                 extractBox64Files();
             checkDependencies();
+            if (launchWithRoot && !ProcessHelper.chownAsRoot(environment.getImageFs().wineprefix)) {
+                Log.w("GuestProgramLauncherComponent", "Root chown failed, falling back to normal launch.");
+                launchWithRoot = false;
+                ProcessHelper.setUseRootForSignals(false);
+            }
             pid = execGuestProgram();
         }
     }
@@ -197,7 +206,7 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
     public void stop() {
         synchronized (lock) {
             if (pid != -1) {
-                Process.killProcess(pid);
+                ProcessHelper.killProcess(pid);
                 pid = -1;
             }
         }
@@ -313,7 +322,7 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
         envVars.put("PATH", winePath + ":" +
                 rootDir.getPath() + "/usr/bin");
 
- 
+
         envVars.put("ANDROID_SYSVSHM_SERVER", rootDir.getPath() + UnixSocketConfig.SYSVSHM_SERVER_PATH);
 
         String primaryDNS = "8.8.4.4";
@@ -324,9 +333,9 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
         }
         envVars.put("ANDROID_RESOLV_DNS", primaryDNS);
         envVars.put("WINE_NEW_NDIS", "1");
-        
+
         String ld_preload = "";
-        
+
         // Check for specific shared memory libraries
         if ((new File(imageFs.getLibDir(), "libandroid-sysvshm.so")).exists()){
             ld_preload = imageFs.getLibDir() + "/libandroid-sysvshm.so";
@@ -360,7 +369,7 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
                 envVars.put("DISPLAYX_SURFACE_FORMAT", "bgra8");
             }
         }
-        
+
         // Merge any additional environment variables from external sources
         if (this.envVars != null) {
             envVars.putAll(this.envVars);
@@ -397,14 +406,18 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
             FileUtils.chmod(box64File, 0755);
         }
 
-        return ProcessHelper.exec(command, envVars.toStringArray(), rootDir, (status) -> {
+        String[] envp = envVars.toStringArray();
+        Callback<Integer> callback = (status) -> {
             synchronized (lock) {
                 pid = -1;
             }
 
             if (terminationCallback != null)
                 terminationCallback.call(status);
-        });
+        };
+        return launchWithRoot
+                ? ProcessHelper.execAsRoot(command, envp, rootDir, callback)
+                : ProcessHelper.exec(command, envp, rootDir, callback);
     }
 
     private void addBox64EnvVars(EnvVars envVars, boolean enableLogs) {
