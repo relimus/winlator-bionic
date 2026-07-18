@@ -98,12 +98,22 @@ public abstract class ProcessHelper {
     }
 
     public static void pauseAllWineProcesses() {
+        if (useRootForSignals) {
+            signalAllWineProcessesAsRoot(SIGSTOP);
+            return;
+        }
+
         for (String process : listRunningWineProcesses()) {
             suspendProcess(Integer.parseInt(process));
         }
     }
 
     public static void resumeAllWineProcesses() {
+        if (useRootForSignals) {
+            signalAllWineProcessesAsRoot(SIGCONT);
+            return;
+        }
+
         for (String process : listRunningWineProcesses()) {
             resumeProcess(Integer.parseInt(process));
         }
@@ -546,6 +556,22 @@ public abstract class ProcessHelper {
             }
         }
         return filteredPids;
+    }
+
+    private static void signalAllWineProcessesAsRoot(int signal) {
+        if (wineProcessEnvFilter.isEmpty()) return;
+
+        int status = execRootCommandAndWait(
+                "for pid in /proc/[0-9]*; do " +
+                "data=$(cat \"$pid/stat\" 2>/dev/null) || continue; " +
+                "case \"$data\" in *wine*|*exe*) ;; *) continue;; esac; " +
+                "tr '\\000' '\\n' < \"$pid/environ\" 2>/dev/null | grep -Fxq " + shellQuote(wineProcessEnvFilter) + " || continue; " +
+                "kill -" + signal + " \"${pid#/proc/}\" 2>/dev/null; " +
+                "done"
+        );
+
+        if (status != 0)
+            Log.w("ProcessHelper", "Failed to send signal " + signal + " to root Wine processes, status=" + status);
     }
 
     private static ArrayList<String> listRunningWineProcessesAsRoot() {
