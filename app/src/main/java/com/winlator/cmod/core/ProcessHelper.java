@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.BooleanSupplier;
 
 public abstract class ProcessHelper {
     public static final boolean PRINT_DEBUG = true; // FIXME change to false
@@ -28,6 +29,8 @@ public abstract class ProcessHelper {
     private static final byte SIGKILL = 9;
     private static volatile boolean useRootForSignals = false;
     private static volatile String wineProcessEnvFilter = "";
+    private static final Object suspendedWineProcessesLock = new Object();
+    private static final ArrayList<String> suspendedWineProcesses = new ArrayList<>();
 
     private static volatile boolean hasUsedRootSession = false;
 
@@ -98,11 +101,23 @@ public abstract class ProcessHelper {
     }
 
     public static void pauseAllWineProcesses() {
+        pauseAllWineProcesses(() -> true);
+    }
+
+    public static void pauseAllWineProcesses(BooleanSupplier shouldPause) {
         if (useRootForSignals) {
-            signalAllWineProcessesAsRoot(SIGSTOP);
+            ArrayList<String> processes = listRunningWineProcessesAsRoot();
+            if (!shouldPause.getAsBoolean()) return;
+
+            synchronized (suspendedWineProcessesLock) {
+                suspendedWineProcesses.clear();
+                suspendedWineProcesses.addAll(processes);
+            }
+            signalWineProcessesAsRoot(processes, SIGSTOP);
             return;
         }
 
+        if (!shouldPause.getAsBoolean()) return;
         for (String process : listRunningWineProcesses()) {
             suspendProcess(Integer.parseInt(process));
         }
@@ -110,7 +125,16 @@ public abstract class ProcessHelper {
 
     public static void resumeAllWineProcesses() {
         if (useRootForSignals) {
-            signalAllWineProcessesAsRoot(SIGCONT);
+            ArrayList<String> processes;
+            synchronized (suspendedWineProcessesLock) {
+                processes = new ArrayList<>(suspendedWineProcesses);
+            }
+
+            if (signalWineProcessesAsRoot(processes, SIGCONT) == 0) {
+                synchronized (suspendedWineProcessesLock) {
+                    suspendedWineProcesses.removeAll(processes);
+                }
+            }
             return;
         }
 
@@ -558,20 +582,27 @@ public abstract class ProcessHelper {
         return filteredPids;
     }
 
-    private static void signalAllWineProcessesAsRoot(int signal) {
-        if (wineProcessEnvFilter.isEmpty()) return;
+    private static int signalWineProcessesAsRoot(List<String> processes, int signal) {
+        if (wineProcessEnvFilter.isEmpty() || processes.isEmpty()) return 0;
+
+        StringBuilder pids = new StringBuilder();
+        for (String process : processes) {
+            if (process.matches("[0-9]+")) pids.append(' ').append(process);
+        }
+        if (pids.length() == 0) return 0;
 
         int status = execRootCommandAndWait(
-                "for pid in /proc/[0-9]*; do " +
-                "data=$(cat \"$pid/stat\" 2>/dev/null) || continue; " +
+                "for pid in" + pids + "; do " +
+                "data=$(cat \"/proc/$pid/stat\" 2>/dev/null) || continue; " +
                 "case \"$data\" in *wine*|*exe*) ;; *) continue;; esac; " +
-                "tr '\\000' '\\n' < \"$pid/environ\" 2>/dev/null | grep -Fxq " + shellQuote(wineProcessEnvFilter) + " || continue; " +
-                "kill -" + signal + " \"${pid#/proc/}\" 2>/dev/null; " +
+                "tr '\\000' '\\n' < \"/proc/$pid/environ\" 2>/dev/null | grep -Fxq " + shellQuote(wineProcessEnvFilter) + " || continue; " +
+                "kill -" + signal + " \"$pid\" 2>/dev/null; " +
                 "done"
         );
 
         if (status != 0)
             Log.w("ProcessHelper", "Failed to send signal " + signal + " to root Wine processes, status=" + status);
+        return status;
     }
 
     private static ArrayList<String> listRunningWineProcessesAsRoot() {

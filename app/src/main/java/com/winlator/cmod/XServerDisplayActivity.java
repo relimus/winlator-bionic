@@ -124,6 +124,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -180,7 +181,8 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     private boolean isRelativeMouseMovement = false;
     private boolean isSuspendEnabled = true;
     private boolean launchWithRoot = true;
-    private volatile boolean isExiting = false;
+    private final AtomicBoolean isExiting = new AtomicBoolean(false);
+    private volatile boolean pauseWineRequested = false;
     private final ExecutorService wineLifecycleExecutor = Executors.newSingleThreadExecutor();
 
     // Inside the XServerDisplayActivity class
@@ -747,10 +749,15 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     }
 
 
-    private void queueWineLifecycleAction(Runnable action) {
-        if (isExiting || wineLifecycleExecutor.isShutdown()) return;
+    private void queueWineLifecycleAction(boolean pause) {
+        pauseWineRequested = pause;
+        if (isExiting.get() || wineLifecycleExecutor.isShutdown()) return;
         wineLifecycleExecutor.execute(() -> {
-            if (!isExiting) action.run();
+            if (isExiting.get() || pauseWineRequested != pause) return;
+            if (pause)
+                ProcessHelper.pauseAllWineProcesses(() -> pauseWineRequested && !isExiting.get());
+            else
+                ProcessHelper.resumeAllWineProcesses();
         });
     }
 
@@ -775,7 +782,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
         handler.postDelayed(savePlaytimeRunnable, SAVE_INTERVAL_MS);
 
         if (!isInPictureInPictureMode() && isSuspendEnabled)
-            queueWineLifecycleAction(ProcessHelper::resumeAllWineProcesses);
+            queueWineLifecycleAction(false);
             
         if (NotificationService.wakeLock != null && NotificationService.wakeLock.isHeld())  
             NotificationService.wakeLock.release();
@@ -805,7 +812,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             xServerView.onPause();
             
             if (isSuspendEnabled)
-                queueWineLifecycleAction(ProcessHelper::pauseAllWineProcesses);
+                queueWineLifecycleAction(true);
         }
 
         savePlaytimeData();
@@ -844,8 +851,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     }
 
     private void exit() {
-        if (isExiting) return;
-        isExiting = true;
+        if (!isExiting.compareAndSet(false, true)) return;
         preloaderDialog.showOnUiThread(R.string.shutdown);
         handler.postDelayed(new Runnable() {
             @Override
@@ -885,7 +891,6 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
 
     @Override
     protected void onDestroy() {
-        if (!isExiting) wineLifecycleExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -953,12 +958,12 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             case R.id.main_menu_pause:
                 if (isPaused) {
                     xServerView.onResume();
-                    queueWineLifecycleAction(ProcessHelper::resumeAllWineProcesses);
+                    queueWineLifecycleAction(false);
                     item.setIcon(R.drawable.icon_pause);
                 }
                 else {
                     xServerView.onPause();
-                    queueWineLifecycleAction(ProcessHelper::pauseAllWineProcesses);
+                    queueWineLifecycleAction(true);
                     item.setIcon(R.drawable.icon_play);
                 }
                 isPaused = !isPaused;
