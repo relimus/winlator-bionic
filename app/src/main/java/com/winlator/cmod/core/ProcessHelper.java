@@ -286,9 +286,90 @@ public abstract class ProcessHelper {
         return chown(path, uid + ":" + uid);
     }
 
+    public static boolean prepareRootSession(String containerPath, long gracefulTimeoutMs, long killTimeoutMs) {
+        if (containerPath == null || containerPath.isEmpty()) return false;
+
+        int uid = Process.myUid();
+        int status = execRootCommandAndWait(
+                "[ \"$(id -u)\" = \"0\" ] || exit 1; " +
+                buildRootWineCleanupCommand(gracefulTimeoutMs, killTimeoutMs) +
+                "chown -R " + shellQuote(uid + ":" + uid) + " " + shellQuote(containerPath)
+        );
+
+        synchronized (suspendedWineProcessesLock) {
+            suspendedWineProcesses.clear();
+        }
+        return status == 0;
+    }
+
+    public static boolean cleanupWineProcessesAsRoot(long gracefulTimeoutMs, long killTimeoutMs) {
+        if (wineProcessEnvFilter.isEmpty()) return true;
+
+        int status = execRootCommandAndWait(
+                buildRootWineCleanupCommand(gracefulTimeoutMs, killTimeoutMs) +
+                "[ -z \"$wine_pids\" ]"
+        );
+
+        synchronized (suspendedWineProcessesLock) {
+            suspendedWineProcesses.clear();
+        }
+        return status == 0;
+    }
+
     private static boolean chown(String path, String owner) {
         if (path == null || path.isEmpty()) return false;
         return execRootCommandAndWait("chown -R " + shellQuote(owner) + " " + shellQuote(path)) == 0;
+    }
+
+    private static String buildRootWineCleanupCommand(long gracefulTimeoutMs, long killTimeoutMs) {
+        int gracefulChecks = (int)Math.max(1, (gracefulTimeoutMs + 49) / 50);
+        int killChecks = (int)Math.max(1, (killTimeoutMs + 49) / 50);
+        String envFilter = shellQuote(wineProcessEnvFilter);
+
+        return "is_target_wine_pid() { " +
+                "pid=\"$1\"; " +
+                "data=$(cat \"/proc/$pid/stat\" 2>/dev/null) || return 1; " +
+                "case \"$data\" in *wine*|*exe*) ;; *) return 1;; esac; " +
+                "tr '\\000' '\\n' < \"/proc/$pid/environ\" 2>/dev/null | grep -Fxq " + envFilter + "; " +
+                "}; " +
+                "wine_pids=''; " +
+                "for proc in /proc/[0-9]*; do " +
+                "pid=${proc#/proc/}; " +
+                "is_target_wine_pid \"$pid\" || continue; " +
+                "wine_pids=\"$wine_pids $pid\"; " +
+                "done; " +
+                "[ -z \"$wine_pids\" ] || kill -15 $wine_pids 2>/dev/null || true; " +
+                "checks=" + gracefulChecks + "; " +
+                "while [ \"$checks\" -gt 0 ] && [ -n \"$wine_pids\" ]; do " +
+                "alive=''; " +
+                "for pid in $wine_pids; do " +
+                "[ -d \"/proc/$pid\" ] && alive=\"$alive $pid\"; " +
+                "done; " +
+                "wine_pids=\"$alive\"; " +
+                "[ -z \"$wine_pids\" ] && break; " +
+                "sleep 0.05; " +
+                "checks=$((checks - 1)); " +
+                "done; " +
+                "if [ -n \"$wine_pids\" ]; then " +
+                "survivors=''; " +
+                "for pid in $wine_pids; do " +
+                "is_target_wine_pid \"$pid\" || continue; " +
+                "survivors=\"$survivors $pid\"; " +
+                "done; " +
+                "wine_pids=\"$survivors\"; " +
+                "[ -z \"$wine_pids\" ] || kill -9 $wine_pids 2>/dev/null || true; " +
+                "fi; " +
+                "checks=" + killChecks + "; " +
+                "while [ \"$checks\" -gt 0 ] && [ -n \"$wine_pids\" ]; do " +
+                "alive=''; " +
+                "for pid in $wine_pids; do " +
+                "[ -d \"/proc/$pid\" ] && alive=\"$alive $pid\"; " +
+                "done; " +
+                "wine_pids=\"$alive\"; " +
+                "[ -z \"$wine_pids\" ] && break; " +
+                "sleep 0.05; " +
+                "checks=$((checks - 1)); " +
+                "done; ";
     }
 
     private static int execRootCommandAndWait(String command) {
