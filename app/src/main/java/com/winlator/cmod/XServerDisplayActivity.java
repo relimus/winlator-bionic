@@ -871,14 +871,6 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
                     cleanupWineProcesses();
                     if (launchWithRoot && ProcessHelper.hasUsedRootSession())
                         ProcessHelper.chownAsAppUser(container.getRootDir().getPath());
-                    /* Wait until all processes have gracefully terminated, forcefully killing them only after a certain amount of time */
-                    long start = System.currentTimeMillis();
-                    while (!ProcessHelper.listRunningWineProcesses().isEmpty()) {
-                        long elapsed = System.currentTimeMillis() - start;
-                        if (elapsed >= 1500) {
-                            break;
-                        }
-                    }
                     wineLifecycleExecutor.shutdown();
                     runOnUiThread(() -> {
                         preloaderDialog.close();
@@ -902,6 +894,12 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     }
 
     private void cleanupWineProcesses() {
+        if (launchWithRoot) {
+            if (!ProcessHelper.cleanupWineProcessesAsRoot(1500, 1000))
+                Log.w("XServerDisplayActivity", "Some root Wine processes remained after forced cleanup.");
+            return;
+        }
+
         /* Gracefully terminate all running wine processes */
         ProcessHelper.terminateAllWineProcesses();
         /* Wait until all processes have gracefully terminated, forcefully killing them only after a certain amount of time */
@@ -912,13 +910,9 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     }
 
     private void prepareRootSession() {
-        launchWithRoot = ProcessHelper.isRootAvailable();
-        ProcessHelper.setUseRootForSignals(launchWithRoot);
         ProcessHelper.setWineProcessEnvFilter(imageFs.wineprefix);
-        if (launchWithRoot) {
-            cleanupWineProcesses();
-            ProcessHelper.chownAsAppUser(container.getRootDir().getPath());
-        }
+        launchWithRoot = ProcessHelper.prepareRootSession(container.getRootDir().getPath(), 1500, 1000);
+        ProcessHelper.setUseRootForSignals(launchWithRoot);
     }
 
     @Override
