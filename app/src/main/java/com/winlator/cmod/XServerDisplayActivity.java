@@ -122,6 +122,7 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -180,6 +181,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     private boolean isSuspendEnabled = true;
     private boolean launchWithRoot = true;
     private volatile boolean isExiting = false;
+    private final ExecutorService wineLifecycleExecutor = Executors.newSingleThreadExecutor();
 
     // Inside the XServerDisplayActivity class
     private SensorManager sensorManager;
@@ -745,6 +747,13 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
     }
 
 
+    private void queueWineLifecycleAction(Runnable action) {
+        if (isExiting || wineLifecycleExecutor.isShutdown()) return;
+        wineLifecycleExecutor.execute(() -> {
+            if (!isExiting) action.run();
+        });
+    }
+
     @Override
     public void onResume() {
         super.onResume();
@@ -766,7 +775,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
         handler.postDelayed(savePlaytimeRunnable, SAVE_INTERVAL_MS);
 
         if (!isInPictureInPictureMode() && isSuspendEnabled)
-        	ProcessHelper.resumeAllWineProcesses();
+            queueWineLifecycleAction(ProcessHelper::resumeAllWineProcesses);
             
         if (NotificationService.wakeLock != null && NotificationService.wakeLock.isHeld())  
             NotificationService.wakeLock.release();
@@ -796,7 +805,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             xServerView.onPause();
             
             if (isSuspendEnabled)
-                ProcessHelper.pauseAllWineProcesses();
+                queueWineLifecycleAction(ProcessHelper::pauseAllWineProcesses);
         }
 
         savePlaytimeData();
@@ -846,7 +855,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
                 if (midiHandler != null) midiHandler.stop();
                 // Unregister sensor listener to avoid memory leaks
                 if (sensorManager != null) sensorManager.unregisterListener(gyroListener);
-                Executors.newSingleThreadExecutor().execute(() -> {
+                wineLifecycleExecutor.execute(() -> {
                     if (environment != null) environment.stopEnvironmentComponents();
                     if (preloaderDialog != null && preloaderDialog.isShowing()) preloaderDialog.closeOnUiThread();
                     if (winHandler != null) winHandler.stop();
@@ -864,6 +873,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
                             break;
                         }
                     }
+                    wineLifecycleExecutor.shutdown();
                     runOnUiThread(() -> {
                         preloaderDialog.close();
                         AppUtils.restartApplication(getApplicationContext());
@@ -875,6 +885,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
 
     @Override
     protected void onDestroy() {
+        if (!isExiting) wineLifecycleExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -942,12 +953,12 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
             case R.id.main_menu_pause:
                 if (isPaused) {
                     xServerView.onResume();
-                    ProcessHelper.resumeAllWineProcesses();
+                    queueWineLifecycleAction(ProcessHelper::resumeAllWineProcesses);
                     item.setIcon(R.drawable.icon_pause);
                 }
                 else {
                     xServerView.onPause();
-                    ProcessHelper.pauseAllWineProcesses();
+                    queueWineLifecycleAction(ProcessHelper::pauseAllWineProcesses);
                     item.setIcon(R.drawable.icon_play);
                 }
                 isPaused = !isPaused;
