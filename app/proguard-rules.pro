@@ -42,6 +42,17 @@
     private void setStride(short);
 }
 
+# The renderer JNI cache resolves these classes, fields, and methods by their
+# original names and signatures in renderer_jni.hpp.
+-keep class com.winlator.cmod.xserver.XServer { *; }
+-keep class com.winlator.cmod.xserver.Window { *; }
+-keep class com.winlator.cmod.xserver.WindowAttributes { *; }
+-keep class com.winlator.cmod.xserver.WindowManager { *; }
+-keep class com.winlator.cmod.xserver.InputDeviceManager { *; }
+-keep class com.winlator.cmod.xserver.Drawable { *; }
+-keep class com.winlator.cmod.xserver.Cursor { *; }
+-keep class com.winlator.cmod.renderer.GPUImage { *; }
+
 # Retrofit needs runtime annotations and generic signatures.
 -keepattributes Signature, RuntimeVisibleAnnotations, RuntimeVisibleParameterAnnotations, AnnotationDefault
 -keep interface com.winlator.cmod.bigpicture.steamgrid.SteamGridDBApi { *; }
