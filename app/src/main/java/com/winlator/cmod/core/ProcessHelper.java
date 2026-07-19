@@ -27,8 +27,10 @@ public abstract class ProcessHelper {
     private static final byte SIGSTOP = 19;
     private static final byte SIGTERM = 15;
     private static final byte SIGKILL = 9;
+    private static final String ROOT_SESSION_ENV = "WINLATOR_ROOT_SESSION";
     private static volatile boolean useRootForSignals = false;
     private static volatile String wineProcessEnvFilter = "";
+    private static volatile String rootSessionEnvFilter = "";
     private static final Object suspendedWineProcessesLock = new Object();
     private static final ArrayList<String> suspendedWineProcesses = new ArrayList<>();
 
@@ -40,6 +42,11 @@ public abstract class ProcessHelper {
 
     public static void setWineProcessEnvFilter(String winePrefix) {
         wineProcessEnvFilter = winePrefix != null && !winePrefix.isEmpty() ? "WINEPREFIX=" + winePrefix : "";
+        rootSessionEnvFilter = "";
+    }
+
+    private static String getActiveRootProcessEnvFilter() {
+        return !rootSessionEnvFilter.isEmpty() ? rootSessionEnvFilter : wineProcessEnvFilter;
     }
 
     public static boolean hasUsedRootSession() {
@@ -204,12 +211,21 @@ public abstract class ProcessHelper {
 
         EnvironmentManager.setEnvVars(envp);
 
+        int appPid = Process.myPid();
+        String rootSessionId = appPid + "-" + System.nanoTime();
+        rootSessionEnvFilter = ROOT_SESSION_ENV + "=" + rootSessionId;
         int pid = -1;
         try {
             File pidFile = createRootPidFile(workingDir);
             java.lang.Process process = Runtime.getRuntime().exec("su");
             hasUsedRootSession = true;
             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream()));
+
+            writer.write("app_pid=" + appPid + "\n");
+            writer.write("app_start=$(awk '{print $22}' \"/proc/$app_pid/stat\" 2>/dev/null)\n");
+            writer.write("is_app_alive() { current_start=$(awk '{print $22}' \"/proc/$app_pid/stat\" 2>/dev/null); " +
+                    "[ -n \"$app_start\" ] && [ \"$current_start\" = \"$app_start\" ]; }\n");
+            writer.write("(\n");
 
             if (envp != null) {
                 for (String entry : envp) {
@@ -222,14 +238,27 @@ public abstract class ProcessHelper {
                 }
             }
 
+            writer.write("export " + ROOT_SESSION_ENV + "=" + shellQuote(rootSessionId) + "\n");
+
             if (workingDir != null) {
                 writer.write("cd " + shellQuote(workingDir.getAbsolutePath()) + "\n");
             }
-            writer.write(command + " &\n");
+            writer.write("exec " + command + "\n");
+            writer.write(") &\n");
             writer.write("child=$!\n");
             writer.write("echo $child > " + shellQuote(pidFile.getAbsolutePath()) + "\n");
+            writer.write("(\n");
+            writer.write("while is_app_alive; do sleep 1; done\n");
+            writer.write(buildRootProcessCleanupCommand(rootSessionEnvFilter, 1500, 1000));
+            writer.write(") &\n");
+            writer.write("watchdog=$!\n");
             writer.write("wait $child\n");
-            writer.write("exit $?\n");
+            writer.write("status=$?\n");
+            writer.write("kill $watchdog 2>/dev/null || true\n");
+            writer.write("wait $watchdog 2>/dev/null || true\n");
+            writer.write(buildRootProcessCleanupCommand(rootSessionEnvFilter, 1500, 1000));
+            writer.write("rm -f " + shellQuote(pidFile.getAbsolutePath()) + "\n");
+            writer.write("exit $status\n");
             writer.flush();
             writer.close();
 
@@ -248,6 +277,7 @@ public abstract class ProcessHelper {
             });
         }
         catch (Exception e) {
+            rootSessionEnvFilter = "";
             Log.e("ProcessHelper", "Error executing root command: " + command, e);
         }
         return pid;
@@ -287,12 +317,12 @@ public abstract class ProcessHelper {
     }
 
     public static boolean prepareRootSession(String containerPath, long gracefulTimeoutMs, long killTimeoutMs) {
-        if (containerPath == null || containerPath.isEmpty()) return false;
+        if (containerPath == null || containerPath.isEmpty() || wineProcessEnvFilter.isEmpty()) return false;
 
         int uid = Process.myUid();
         int status = execRootCommandAndWait(
                 "[ \"$(id -u)\" = \"0\" ] || exit 1; " +
-                buildRootWineCleanupCommand(gracefulTimeoutMs, killTimeoutMs) +
+                buildRootProcessCleanupCommand(wineProcessEnvFilter, gracefulTimeoutMs, killTimeoutMs) +
                 "chown -R " + shellQuote(uid + ":" + uid) + " " + shellQuote(containerPath)
         );
 
@@ -303,16 +333,18 @@ public abstract class ProcessHelper {
     }
 
     public static boolean cleanupWineProcessesAsRoot(long gracefulTimeoutMs, long killTimeoutMs) {
-        if (wineProcessEnvFilter.isEmpty()) return true;
+        String envFilter = getActiveRootProcessEnvFilter();
+        if (envFilter.isEmpty()) return true;
 
         int status = execRootCommandAndWait(
-                buildRootWineCleanupCommand(gracefulTimeoutMs, killTimeoutMs) +
-                "[ -z \"$wine_pids\" ]"
+                buildRootProcessCleanupCommand(envFilter, gracefulTimeoutMs, killTimeoutMs) +
+                "[ -z \"$target_pids\" ]"
         );
 
         synchronized (suspendedWineProcessesLock) {
             suspendedWineProcesses.clear();
         }
+        if (status == 0) rootSessionEnvFilter = "";
         return status == 0;
     }
 
@@ -321,55 +353,44 @@ public abstract class ProcessHelper {
         return execRootCommandAndWait("chown -R " + shellQuote(owner) + " " + shellQuote(path)) == 0;
     }
 
-    private static String buildRootWineCleanupCommand(long gracefulTimeoutMs, long killTimeoutMs) {
+    private static String buildRootProcessCleanupCommand(String envFilter, long gracefulTimeoutMs, long killTimeoutMs) {
+        if (envFilter == null || envFilter.isEmpty()) return "target_pids=''; ";
         int gracefulChecks = (int)Math.max(1, (gracefulTimeoutMs + 49) / 50);
         int killChecks = (int)Math.max(1, (killTimeoutMs + 49) / 50);
-        String envFilter = shellQuote(wineProcessEnvFilter);
+        String quotedFilter = shellQuote(envFilter);
 
-        return "is_target_wine_pid() { " +
+        return "is_target_root_pid() { " +
                 "pid=\"$1\"; " +
-                "data=$(cat \"/proc/$pid/stat\" 2>/dev/null) || return 1; " +
-                "case \"$data\" in *wine*|*exe*) ;; *) return 1;; esac; " +
-                "tr '\\000' '\\n' < \"/proc/$pid/environ\" 2>/dev/null | grep -Fxq " + envFilter + "; " +
+                "tr '\\000' '\\n' < \"/proc/$pid/environ\" 2>/dev/null | grep -Fxq " + quotedFilter + "; " +
                 "}; " +
-                "wine_pids=''; " +
+                "collect_target_pids() { " +
+                "target_pids=''; " +
                 "for proc in /proc/[0-9]*; do " +
                 "pid=${proc#/proc/}; " +
-                "is_target_wine_pid \"$pid\" || continue; " +
-                "wine_pids=\"$wine_pids $pid\"; " +
+                "is_target_root_pid \"$pid\" || continue; " +
+                "target_pids=\"$target_pids $pid\"; " +
                 "done; " +
-                "[ -z \"$wine_pids\" ] || kill -15 $wine_pids 2>/dev/null || true; " +
-                "checks=" + gracefulChecks + "; " +
-                "while [ \"$checks\" -gt 0 ] && [ -n \"$wine_pids\" ]; do " +
+                "}; " +
+                "wait_for_target_pids() { " +
+                "checks=\"$1\"; " +
+                "while [ \"$checks\" -gt 0 ] && [ -n \"$target_pids\" ]; do " +
                 "alive=''; " +
-                "for pid in $wine_pids; do " +
-                "[ -d \"/proc/$pid\" ] && alive=\"$alive $pid\"; " +
+                "for pid in $target_pids; do " +
+                "is_target_root_pid \"$pid\" && alive=\"$alive $pid\"; " +
                 "done; " +
-                "wine_pids=\"$alive\"; " +
-                "[ -z \"$wine_pids\" ] && break; " +
+                "target_pids=\"$alive\"; " +
+                "[ -z \"$target_pids\" ] && break; " +
                 "sleep 0.05; " +
                 "checks=$((checks - 1)); " +
                 "done; " +
-                "if [ -n \"$wine_pids\" ]; then " +
-                "survivors=''; " +
-                "for pid in $wine_pids; do " +
-                "is_target_wine_pid \"$pid\" || continue; " +
-                "survivors=\"$survivors $pid\"; " +
-                "done; " +
-                "wine_pids=\"$survivors\"; " +
-                "[ -z \"$wine_pids\" ] || kill -9 $wine_pids 2>/dev/null || true; " +
-                "fi; " +
-                "checks=" + killChecks + "; " +
-                "while [ \"$checks\" -gt 0 ] && [ -n \"$wine_pids\" ]; do " +
-                "alive=''; " +
-                "for pid in $wine_pids; do " +
-                "[ -d \"/proc/$pid\" ] && alive=\"$alive $pid\"; " +
-                "done; " +
-                "wine_pids=\"$alive\"; " +
-                "[ -z \"$wine_pids\" ] && break; " +
-                "sleep 0.05; " +
-                "checks=$((checks - 1)); " +
-                "done; ";
+                "}; " +
+                "collect_target_pids; " +
+                "[ -z \"$target_pids\" ] || kill -15 $target_pids 2>/dev/null || true; " +
+                "wait_for_target_pids " + gracefulChecks + "; " +
+                "collect_target_pids; " +
+                "[ -z \"$target_pids\" ] || kill -9 $target_pids 2>/dev/null || true; " +
+                "wait_for_target_pids " + killChecks + "; " +
+                "collect_target_pids; ";
     }
 
     private static int execRootCommandAndWait(String command) {
@@ -664,7 +685,8 @@ public abstract class ProcessHelper {
     }
 
     private static int signalWineProcessesAsRoot(List<String> processes, int signal) {
-        if (wineProcessEnvFilter.isEmpty() || processes.isEmpty()) return 0;
+        String envFilter = getActiveRootProcessEnvFilter();
+        if (envFilter.isEmpty() || processes.isEmpty()) return 0;
 
         StringBuilder pids = new StringBuilder();
         for (String process : processes) {
@@ -674,9 +696,7 @@ public abstract class ProcessHelper {
 
         int status = execRootCommandAndWait(
                 "for pid in" + pids + "; do " +
-                "data=$(cat \"/proc/$pid/stat\" 2>/dev/null) || continue; " +
-                "case \"$data\" in *wine*|*exe*) ;; *) continue;; esac; " +
-                "tr '\\000' '\\n' < \"/proc/$pid/environ\" 2>/dev/null | grep -Fxq " + shellQuote(wineProcessEnvFilter) + " || continue; " +
+                "tr '\\000' '\\n' < \"/proc/$pid/environ\" 2>/dev/null | grep -Fxq " + shellQuote(envFilter) + " || continue; " +
                 "kill -" + signal + " \"$pid\" 2>/dev/null; " +
                 "done"
         );
@@ -688,13 +708,12 @@ public abstract class ProcessHelper {
 
     private static ArrayList<String> listRunningWineProcessesAsRoot() {
         ArrayList<String> filteredPids = new ArrayList<>();
-        if (wineProcessEnvFilter.isEmpty()) return filteredPids;
+        String envFilter = getActiveRootProcessEnvFilter();
+        if (envFilter.isEmpty()) return filteredPids;
 
         ArrayList<String> lines = execRootCommandAndReadLines(
                 "for pid in /proc/[0-9]*; do " +
-                "data=$(cat \"$pid/stat\" 2>/dev/null) || continue; " +
-                "case \"$data\" in *wine*|*exe*) ;; *) continue;; esac; " +
-                "tr '\\000' '\\n' < \"$pid/environ\" 2>/dev/null | grep -Fxq " + shellQuote(wineProcessEnvFilter) + " || continue; " +
+                "tr '\\000' '\\n' < \"$pid/environ\" 2>/dev/null | grep -Fxq " + shellQuote(envFilter) + " || continue; " +
                 "echo \"${pid#/proc/}\"; " +
                 "done"
         );
