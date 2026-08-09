@@ -65,7 +65,7 @@ void EGLRenderer::renderingThreadLoop() {
         
         if (state == State::STOP) {
             printf("Received state STOP");
-            cache->detachEnv(env);
+            cache->detachEnv();
             state = State::NONE;
             renderLock.notify();
             return;

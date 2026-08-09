@@ -98,9 +98,8 @@ class JNICache {
             return env;
         }
         
-        void detachEnv(JNIEnv *env) {
+        void detachEnv() {
             vm->DetachCurrentThread();
-            delete env;
         }
         
         void init (JavaVM *vm, JNIEnv *env) {
