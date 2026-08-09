@@ -35,6 +35,11 @@
     private void handleNewConnection(int);
     private void handleExistingConnection(int);
 }
+-keep class com.winlator.cmod.XServerDisplayActivity {
+    boolean performanceMode;
+    float getRefreshRate();
+    void updateFrameRating(com.winlator.cmod.xserver.Window);
+}
 -keepclassmembers class com.winlator.cmod.xconnector.ClientSocket {
     public void addAncillaryFd(int);
 }
